@@ -1,0 +1,16 @@
+# VS Code
+.vscode/
+.history/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+env/
+venv/
+
+# Logs & data
+logs/
+*.log
+data/incoming/*
+data/quarantine/*
