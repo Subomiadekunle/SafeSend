@@ -1,5 +1,6 @@
-# src/python/safesend/receiver.py
-import argparse, os, socket, struct, threading
+# UPDATED receiver.py with Option B (press 'q' to quit server)
+
+import argparse, os, socket, struct, threading, sys
 from pathlib import Path
 from .protocol import DEFAULT_PORT, PROTOCOL_VERSION
 from .util.crc32 import crc32_bytes
@@ -58,17 +59,16 @@ def write_resume_offset(st_path: Path, offset: int):
 
 def handle_client(conn: socket.socket, addr):
     try:
-        # ---- HELLO
         hello = recv_line(conn)
         if not hello.startswith("HELLO "):
             send_line(conn, "ERR bad HELLO")
             return
+
         version = int(hello.split()[1])
         if version != PROTOCOL_VERSION:
             send_line(conn, f"ERR version_mismatch server={PROTOCOL_VERSION}")
             return
 
-        # ---- RESUME?
         resume_q = recv_line(conn)
         if not resume_q.startswith("RESUME? "):
             send_line(conn, "ERR expected RESUME?")
@@ -77,10 +77,8 @@ def handle_client(conn: socket.socket, addr):
         filename = resume_q.split(maxsplit=1)[1]
         partial_path, state_path, meta_path = state_paths(filename)
         start_offset = read_resume_offset(state_path)
-
         send_line(conn, f"RESUME {start_offset}")
 
-        # ---- META
         meta = recv_line(conn)
         if not meta.startswith("META "):
             send_line(conn, "ERR expected META")
@@ -91,7 +89,6 @@ def handle_client(conn: socket.socket, addr):
             send_line(conn, "ERR bad META")
             return
 
-        # META Homework 3 CN.pdf 12345 abcdef123...
         _, *fname_parts, r_size, r_sha = parts
         r_fname = " ".join(fname_parts)
         expect_size = int(r_size)
@@ -101,34 +98,26 @@ def handle_client(conn: socket.socket, addr):
 
         with open(partial_path, mode) as out_f:
 
-            # If resume offset is inconsistent
             if start_offset and out_f.seek(0, 2) < start_offset:
                 out_f.truncate(0)
                 write_resume_offset(state_path, 0)
                 start_offset = 0
 
             send_line(conn, "READY")
-
             last_acked = -1
 
             while True:
-
                 peek = conn.recv(1, socket.MSG_PEEK)
                 if not peek:
                     break
 
-                # Check for DONE signal
                 if peek == b"D":
                     line = recv_line(conn)
                     if line == "DONE":
-                        # finalize writing
                         out_f.flush()
                         final_size = out_f.seek(0, 2)
-
-                        # IMPORTANT — close before moving (Windows requirement)
                         out_f.close()
 
-                        # validate size
                         if final_size != expect_size:
                             print(f"[warn] size mismatch: got={final_size} expect={expect_size}")
 
@@ -157,7 +146,6 @@ def handle_client(conn: socket.socket, addr):
                         send_line(conn, "DONE_OK")
                         return
 
-                # ---- CHNK
                 header = conn.recv(CHUNK_HDR_SIZE)
                 if not header:
                     break
@@ -183,19 +171,25 @@ def handle_client(conn: socket.socket, addr):
                 out_f.seek(offset)
                 out_f.write(payload)
                 last_acked = seq
-
                 write_resume_offset(state_path, offset + length)
-
                 conn.sendall(struct.pack(ACK_FMT, b"ACK!", seq))
 
     except Exception as e:
         print("[error]", e)
-
     finally:
         try:
             conn.close()
         except:
             pass
+
+
+def monitor_keyboard():
+    print("[recv] Press 'q' to stop server...")
+    while True:
+        ch = sys.stdin.read(1)
+        if ch.lower() == 'q':
+            print("[recv] Shutting down server...")
+            os._exit(0)
 
 
 def run_server(port: int):
@@ -204,6 +198,7 @@ def run_server(port: int):
         srv.bind(("", port))
         srv.listen(8)
         print(f"[recv] listening on 0.0.0.0:{port}")
+
         while True:
             conn, addr = srv.accept()
             print("[recv] connection from", addr)
@@ -214,4 +209,7 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--port", type=int, default=DEFAULT_PORT)
     args = ap.parse_args()
+
+    threading.Thread(target=monitor_keyboard, daemon=True).start()
     run_server(args.port)
+# UPDATED receiver.py with Option B (press 'q' to quit server)
