@@ -5,17 +5,21 @@ from .protocol import CHUNK_SIZE, DEFAULT_PORT, PROTOCOL_VERSION
 from .util.crc32 import crc32_bytes
 from .util.hashing import sha256_file
 
-CHUNK_HDR_FMT = "!4s I Q I I"    # "CHNK", seq, offset, length, crc32
+# PERFORMANCE
+from .performance import log_transfer, now_ms
+
+CHUNK_HDR_FMT = "!4s I Q I I"
 CHUNK_HDR_SIZE = struct.calcsize(CHUNK_HDR_FMT)
-ACK_FMT = "!4s I"                # "ACK!", seq
+ACK_FMT = "!4s I"
 
 ENC = "utf-8"
-SOCKET_TIMEOUT = 5.0             # seconds
-RETX_TIMEOUT = 2.0               # retransmit wait
-WINDOW_SIZE = 1                  # stop-and-wait (simpler for week 1–2)
+SOCKET_TIMEOUT = 5.0
+RETX_TIMEOUT = 2.0
+
 
 def send_line(sock: socket.socket, line: str):
     sock.sendall((line + "\n").encode(ENC))
+
 
 def recv_line(sock: socket.socket) -> str:
     buf = b""
@@ -28,39 +32,47 @@ def recv_line(sock: socket.socket) -> str:
         buf += ch
     return buf.decode(ENC).rstrip("\r")
 
+
 def handshake(sock: socket.socket, file_path: Path) -> int:
-    """
-    Returns start_offset for resume (0 if new).
-    """
     size = file_path.stat().st_size
     digest = sha256_file(file_path)
     fname = file_path.name
 
     send_line(sock, f"HELLO {PROTOCOL_VERSION}")
-    # Ask server if we should resume: server returns highest safe offset
     send_line(sock, f"RESUME? {fname}")
+
     resume_line = recv_line(sock)
-    # Expected: "RESUME <offset>" or "RESUME 0"
     if not resume_line.startswith("RESUME "):
         raise RuntimeError(f"Bad resume reply: {resume_line}")
+
     start_offset = int(resume_line.split()[1])
 
-    # Now declare the file metadata (server will cross-check when complete)
     send_line(sock, f"META {fname} {size} {digest}")
 
-    # Wait until server says READY
     ready = recv_line(sock)
     if ready != "READY":
         raise RuntimeError(f"Expected READY, got: {ready}")
 
     return start_offset
 
-def send_file(host: str, port: int, file_path: str):
+
+def send_file(host: str,
+              port: int,
+              file_path: str,
+              progress_callback=None):
+    """
+    Extended sender with optional GUI progress callback.
+    progress_callback(sent_bytes, total_bytes)
+    """
     file = Path(file_path)
     size = file.stat().st_size
 
+    # performance
+    start_ms = now_ms()
+    retransmissions = 0
+
     with socket.create_connection((host, port), timeout=SOCKET_TIMEOUT) as s:
-        # 1) Handshake + resume probe
+
         start_offset = handshake(s, file)
 
         seq = 0
@@ -68,9 +80,9 @@ def send_file(host: str, port: int, file_path: str):
         if start_offset:
             print(f"[resume] continuing from offset {start_offset:,}")
 
-        # 2) Seek and send chunks
         with open(file, "rb") as f:
             f.seek(start_offset)
+
             while offset < size:
                 payload = f.read(CHUNK_SIZE)
                 if not payload:
@@ -78,33 +90,44 @@ def send_file(host: str, port: int, file_path: str):
 
                 length = len(payload)
                 crc = crc32_bytes(payload)
+
                 header = struct.pack(
                     CHUNK_HDR_FMT, b"CHNK", seq, offset, length, crc
                 )
 
-                # Send and wait for ACK (stop-and-wait; you can window later)
+                # stop-and-wait
                 deadline = time.time() + RETX_TIMEOUT
                 while True:
                     try:
                         s.sendall(header + payload)
-                        # Block for ACK
-                        ack_tag, ack_seq = struct.unpack(ACK_FMT, s.recv(struct.calcsize(ACK_FMT)))
+
+                        ack = s.recv(struct.calcsize(ACK_FMT))
+                        ack_tag, ack_seq = struct.unpack(ACK_FMT, ack)
+
                         if ack_tag != b"ACK!":
-                            raise RuntimeError("Bad ACK tag")
-                        if ack_seq != seq:
-                            # Unexpected seq; keep waiting briefly (or treat as error)
                             continue
-                        # We are acked; move to next chunk
+                        if ack_seq != seq:
+                            continue
+
                         break
+
                     except (socket.timeout, TimeoutError):
                         if time.time() > deadline:
+                            retransmissions += 1
                             print(f"[retx] seq {seq} timed out; retransmitting")
                             continue
 
                 seq += 1
                 offset += length
 
-        # 3) Signal completion
+                # GUI progress callback
+                if progress_callback is not None:
+                    try:
+                        progress_callback(offset, size)
+                    except Exception:
+                        pass  # never let GUI crash sender
+
+        # DONE
         send_line(s, "DONE")
         done_reply = recv_line(s)
         if done_reply != "DONE_OK":
@@ -112,10 +135,13 @@ def send_file(host: str, port: int, file_path: str):
 
         print(f"[ok] sent {file.name} bytes={size:,} chunks={seq}")
 
-if __name__ == "__main__":
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--host", default="127.0.0.1")
-    ap.add_argument("--port", type=int, default=DEFAULT_PORT)
-    ap.add_argument("--file", required=True)
-    args = ap.parse_args()
-    send_file(args.host, args.port, args.file)
+    # performance log
+    end_ms = now_ms()
+    log_transfer(
+        filename=file.name,
+        size=size,
+        chunks=seq,
+        start_ms=start_ms,
+        end_ms=end_ms,
+        retransmissions=retransmissions
+    )

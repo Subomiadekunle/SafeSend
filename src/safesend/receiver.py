@@ -1,3 +1,4 @@
+# receiver.py
 # UPDATED receiver.py with Option B (press 'q' to quit server)
 
 import argparse, os, socket, struct, threading, sys
@@ -20,7 +21,31 @@ STATE_DIR.mkdir(parents=True, exist_ok=True)
 RECEIVED_DIR.mkdir(parents=True, exist_ok=True)
 QUAR_DIR.mkdir(parents=True, exist_ok=True)
 
+# --------------------------------------------------------------------
+# Centralized logging so GUI / CLI / performance.py can all share it
+# --------------------------------------------------------------------
+_LOGGER = print  # default to stdout for CLI use
 
+
+def set_logger(func):
+    """
+    Set a global logger function.
+    func: callable(str) -> None
+    """
+    global _LOGGER
+    _LOGGER = func
+
+
+def log(msg: str):
+    """
+    Wrapper used everywhere instead of print().
+    """
+    _LOGGER(str(msg))
+
+
+# --------------------------------------------------------------------
+# Protocol helpers
+# --------------------------------------------------------------------
 def send_line(sock: socket.socket, line: str):
     sock.sendall((line + "\n").encode(ENC))
 
@@ -57,6 +82,9 @@ def write_resume_offset(st_path: Path, offset: int):
     st_path.write_text(str(offset), encoding="utf-8")
 
 
+# --------------------------------------------------------------------
+# Core client handler
+# --------------------------------------------------------------------
 def handle_client(conn: socket.socket, addr):
     try:
         hello = recv_line(conn)
@@ -107,6 +135,7 @@ def handle_client(conn: socket.socket, addr):
             last_acked = -1
 
             while True:
+                # Peek to check for DONE
                 peek = conn.recv(1, socket.MSG_PEEK)
                 if not peek:
                     break
@@ -119,11 +148,11 @@ def handle_client(conn: socket.socket, addr):
                         out_f.close()
 
                         if final_size != expect_size:
-                            print(f"[warn] size mismatch: got={final_size} expect={expect_size}")
+                            log(f"[warn] size mismatch: got={final_size} expect={expect_size}")
 
                         digest = sha256_file(partial_path)
                         if digest != r_sha:
-                            print(f"[warn] SHA mismatch: got={digest} expect={r_sha}")
+                            log(f"[warn] SHA mismatch: got={digest} expect={r_sha}")
 
                         infected, msg = scan_file(partial_path)
 
@@ -132,13 +161,13 @@ def handle_client(conn: socket.socket, addr):
                             if dst.exists():
                                 dst.unlink()
                             partial_path.replace(dst)
-                            print(f"[quarantine] {dst} :: {msg}")
+                            log(f"[quarantine] {dst} :: {msg}")
                         else:
                             dst = RECEIVED_DIR / r_fname
                             if dst.exists():
                                 dst.unlink()
                             partial_path.replace(dst)
-                            print(f"[clean] received {dst} sha256={digest}")
+                            log(f"[clean] received {dst} sha256={digest}")
 
                             state_path.unlink(missing_ok=True)
                             meta_path.unlink(missing_ok=True)
@@ -146,6 +175,7 @@ def handle_client(conn: socket.socket, addr):
                         send_line(conn, "DONE_OK")
                         return
 
+                # Receive header
                 header = conn.recv(CHUNK_HDR_SIZE)
                 if not header:
                     break
@@ -154,6 +184,7 @@ def handle_client(conn: socket.socket, addr):
                 if tag != b"CHNK":
                     continue
 
+                # Receive payload
                 payload = b""
                 remaining = length
                 while remaining > 0:
@@ -163,11 +194,14 @@ def handle_client(conn: socket.socket, addr):
                     payload += chunk
                     remaining -= len(chunk)
 
+                # CRC check
                 calc = crc32_bytes(payload)
                 if calc != crc:
+                    # Re-ACK last good seq to request retransmission
                     conn.sendall(struct.pack(ACK_FMT, b"ACK!", last_acked if last_acked >= 0 else 0xFFFFFFFF))
                     continue
 
+                # Write and update resume offset
                 out_f.seek(offset)
                 out_f.write(payload)
                 last_acked = seq
@@ -175,33 +209,46 @@ def handle_client(conn: socket.socket, addr):
                 conn.sendall(struct.pack(ACK_FMT, b"ACK!", seq))
 
     except Exception as e:
-        print("[error]", e)
+        log(f"[error] {e}")
     finally:
         try:
             conn.close()
-        except:
+        except Exception:
             pass
 
 
+# --------------------------------------------------------------------
+# Keyboard monitoring for CLI mode
+# --------------------------------------------------------------------
 def monitor_keyboard():
-    print("[recv] Press 'q' to stop server...")
+    log("[recv] Press 'q' to stop server...")
     while True:
         ch = sys.stdin.read(1)
         if ch.lower() == 'q':
-            print("[recv] Shutting down server...")
+            log("[recv] Shutting down server...")
             os._exit(0)
 
 
-def run_server(port: int):
+# --------------------------------------------------------------------
+# Server entry point
+# --------------------------------------------------------------------
+def run_server(port: int, logger=None):
+    """
+    Start the SafeSend receiver server on the given port.
+    If logger is provided, use it for all log output.
+    """
+    if logger is not None:
+        set_logger(logger)
+
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as srv:
         srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         srv.bind(("", port))
         srv.listen(8)
-        print(f"[recv] listening on 0.0.0.0:{port}")
+        log(f"[recv] listening on 0.0.0.0:{port}")
 
         while True:
             conn, addr = srv.accept()
-            print("[recv] connection from", addr)
+            log(f"[recv] connection from {addr}")
             threading.Thread(target=handle_client, args=(conn, addr), daemon=True).start()
 
 
@@ -210,6 +257,7 @@ if __name__ == "__main__":
     ap.add_argument("--port", type=int, default=DEFAULT_PORT)
     args = ap.parse_args()
 
+    # CLI mode: still support 'q' to quit
     threading.Thread(target=monitor_keyboard, daemon=True).start()
     run_server(args.port)
 # UPDATED receiver.py with Option B (press 'q' to quit server)
